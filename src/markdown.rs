@@ -373,8 +373,7 @@ fn pull_elements<'a, 'b: 'a>(
             Event::Text(text) => {
                 if !cx.in_non_writing_block {
                     let escaped = escape_html_body(text).to_string();
-                    // Convert multiple newlines to visible breaks
-                    let processed = escaped.replace("\n\n", "\n\u{200B}\n");  // Zero-width space
+                    let processed = escaped.replace("\n", "<br />\n"); // **Convert all newlines to `<br />`**
                     rsx! { {processed} }
                 } else {
                     rsx!()

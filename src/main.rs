@@ -25,7 +25,7 @@ fn App() -> Element {
     // State to track a selection range (anchor, active). When None, no highlighting.
     let selection_range = use_signal(|| None::<(usize, usize)>);
 
-    let editor_initialized = use_signal(|| false);
+    let mut editor_clicked = use_signal(|| false);
     let prev_raw_text = use_signal(|| String::new());
 
     let sync_editor_content = {
@@ -63,21 +63,45 @@ fn App() -> Element {
                 (function() {{
                     const el = document.getElementById("editor");
                     if (!el) return;
-                    
+
                     el.focus();
                     const sel = window.getSelection();
                     sel.removeAllRanges();
-                    
+
                     const range = document.createRange();
-                    const textNode = el.firstChild || document.createTextNode('');
-                    range.setStart(textNode, {pos});
+                    let position = {pos}; // Position to move caret
+
+                    // Function to traverse text nodes
+                    function findTextNodeAndOffset(node, pos) {{
+                        let stack = [node];
+                        let offset = 0;
+
+                        while (stack.length > 0) {{
+                            let current = stack.shift();
+
+                            if (current.nodeType === Node.TEXT_NODE) {{
+                                if (offset + current.length >= pos) {{
+                                    return {{ node: current, offset: pos - offset }};
+                                }}
+                                offset += current.length;
+                            }} else {{
+                                for (let i = 0; i < current.childNodes.length; i++) {{
+                                    stack.push(current.childNodes[i]);
+                                }}
+                            }}
+                        }}
+                        return {{ node: el, offset: 0 }};
+                    }}
+
+                    let result = findTextNodeAndOffset(el, position);
+                    range.setStart(result.node, result.offset);
                     range.collapse(true);
                     sel.addRange(range);
                 }})();
                 "#,
                 pos = pos
             );
-            tokio::time::sleep(Duration::from_millis(20)).await; // Increased delay
+            tokio::time::sleep(Duration::from_millis(100)).await; // Increased delay
             document::eval(&js_code).await.ok();
         }
     });
@@ -92,43 +116,15 @@ fn App() -> Element {
         }
     };
 
-    // Updated update_caret function with a delay.
-    let update_caret = {
-        move || {
-            spawn(
-                async move {
-                    let js_code = r#"
-                        (function() {
-                            let el = document.getElementById("editor");
-                            if (!el) return -1;
-                            let sel = window.getSelection();
-                            if (!sel || sel.rangeCount === 0) return -1;
-                            let range = sel.getRangeAt(0);
-                            let preCaretRange = range.cloneRange();
-                            preCaretRange.selectNodeContents(el);
-                            preCaretRange.setEnd(range.endContainer, range.endOffset);
-                            return preCaretRange.toString().length;
-                        })();
-                    "#;
-                    if let Ok(result) = document::eval(js_code).await {
-                        if let Ok(pos) = result.to_string().parse::<isize>() {
-                            let pos = if pos < 0 { 0 } else { pos as usize };
-                            caret_pos.with_mut(|cp| *cp = Some(pos));
-                            caret_queue.send(pos);
-                            println!("update caret {:?}", caret_pos.read());
-                        }
-                    }
-                }
-            );
-        }
-    };
-
     // Modify the sync task to use the LATEST caret position
     let _sync_task = use_coroutine(move |_rx: UnboundedReceiver<()>| async move {
         loop {
             // Get the position RIGHT BEFORE syncing
             let current_pos = *caret_pos.read();
+            let was_clicked = *editor_clicked.read();
             
+
+
             // First update the editor content
             let js_sync = r#"
                 const preview = document.getElementById('preview');
@@ -136,118 +132,84 @@ fn App() -> Element {
                 editor.innerHTML = preview.innerHTML;
             "#;
             document::eval(js_sync).await.ok();
-
+   
             // Then set caret position if needed
-            if let Some(pos) = current_pos {
-                let js_caret = format!(
-                    r#"
-                    const range = document.createRange();
-                    const sel = window.getSelection();
-                    range.setStart(editor.firstChild, {pos});
-                    range.collapse(true);
-                    sel.removeAllRanges();
-                    sel.addRange(range);
-                    "#
-                );
-                document::eval(&js_caret).await.ok();
-            }
+            if let Some(pos) = current_pos{
 
-            tokio::time::sleep(Duration::from_millis(100)).await;
+                if was_clicked {
+                    caret_pos.with_mut(|cp| *cp = Some(pos));
+                    caret_queue.send(pos);
+                    editor_clicked.set(false);
+                    println!("pos {:?}", pos);
+                }
+            } else {
+
+                if !was_clicked {
+                    caret_pos.with_mut(|cp| *cp = None);
+                }
+                // println!("pos {:?}", pos);
+            }
+            tokio::time::sleep(Duration::from_millis(1000)).await;
         }
     });
-
+    // Helper: Update caret position by executing JS that computes the offset.
     let update_caret_click = {
-        let caret_queue = caret_queue.clone();
-        move |evt: MouseEvent| {
-            let coords = evt.client_coordinates();
-            
-            spawn(async move {
-                let js_code = format!(
-                    r#"
-                    (function() {{
-                        try {{
-                            const editor = document.getElementById('editor');
-                            if (!editor) return {{ error: "No editor element" }};
-                            
-                            const rect = editor.getBoundingClientRect();
-                            const clickX = {x} + window.scrollX;
-                            const clickY = {y} + window.scrollY;
-                            
-                            let range;
-                            if (document.caretRangeFromPoint) {{
-                                range = document.caretRangeFromPoint(clickX, clickY);
-                            }} else {{
-                                const pos = document.caretPositionFromPoint(clickX, clickY);
-                                if (!pos) return {{ error: "No caret position" }};
-                                range = document.createRange();
-                                range.setStart(pos.offsetNode, pos.offset);
-                            }}
-                            
-                            if (!range || !editor.contains(range.startContainer)) {{
-                                return {{ error: "Invalid range" }};
-                            }}
-                            
-                            let offset = 0;
-                            const walker = document.createTreeWalker(
-                                editor,
-                                NodeFilter.SHOW_TEXT,
-                                null,
-                                false
-                            );
-                            
-                            let node = walker.nextNode();
-                            while (node && node !== range.startContainer) {{
-                                offset += node.textContent.length;
-                                node = walker.nextNode();
-                            }}
-                            
-                            offset += range.startOffset;
-                            return {{ offset: offset }};
-                            
-                        }} catch (e) {{
-                            return {{ error: e.toString() }};
-                        }}
-                    }})()
-                    "#,
-                    x = coords.x as f64,
-                    y = coords.y as f64
-                );
+        move || {
+            spawn(
+                async move {
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                    let js_code = r#"
+                    let el = document.getElementById("editor");
+                    let selection = window.getSelection();
+                    if (!selection.rangeCount) return 0;
 
-                match document::eval(&js_code).await {
-                    Ok(result) => {
-                        let json_str = result.to_string();
-                        match serde_json::from_str::<Value>(&json_str) {
-                            Ok(json) => {
-                                if let Some(offset) = json["offset"].as_u64() {
-                                    caret_pos.with_mut(|cp| *cp = Some(offset as usize));
-                                    caret_queue.send(offset as usize);
-                                }
-                            }
-                            Err(_) => println!("Invalid JSON response: {}", json_str),
+                    let range = selection.getRangeAt(0);
+                    let preCaretRange = range.cloneRange();
+                    preCaretRange.selectNodeContents(el);
+                    preCaretRange.setEnd(range.endContainer, range.endOffset);
+
+                    // Correctly traverse the text nodes and count characters
+                    let offset = 0;
+                    let treeWalker = document.createTreeWalker(el, NodeFilter.SHOW_TEXT, null, false);
+
+                    while (treeWalker.nextNode()) {
+                        let node = treeWalker.currentNode;
+                        if (node === range.endContainer) {
+                            offset += range.endOffset;
+                            break;
+                        }
+                        offset += node.textContent.length;
+                    }
+                    return offset;
+                "#;
+                    if let Ok(result) = document::eval(js_code).await {
+                        if let Ok(pos) = result.to_string().parse::<usize>() {
+                            println!("click {:?}", pos);
+                            caret_pos.with_mut(|cp| *cp = Some(pos));
+                            caret_queue.send(pos)
                         }
                     }
-                    Err(e) => println!("JS execution error: {:?}", e),
                 }
-            });
+            );
         }
     };
-
-
-
-
+    
 
     // Key handler: intercept key events and update our raw_text and caret.
     let handle_keydown = {
         let mut raw_text = raw_text.clone();
         let mut caret_pos = caret_pos.clone();
         let mut selection_range = selection_range.clone();
-        let update_caret = update_caret.clone();
-        let set_caret = set_caret.clone();
         let mut undo_stack = undo_stack.clone();
         move |evt: KeyboardEvent| {
             let text = raw_text.read().clone();
-            let pos = caret_pos.read().unwrap_or(0);
 
+            let pos = match *caret_pos.read() {
+                Some(pos) => pos,
+                None => return,
+            };
+
+            println!{"handle keydown {:?}", pos}
             // update_caret();
 
             // If CTRL is pressed, handle CTRL shortcuts first.
@@ -673,6 +635,7 @@ fn App() -> Element {
                     if !new_text.is_empty() && new_text != *raw_text.read() {
                         prev_raw_text.set(new_text.to_string());
                         raw_text.set(new_text.to_string());
+                        set_caret();
                     }
                 }
             });
@@ -694,8 +657,8 @@ fn App() -> Element {
                     style: "height: 200px; overflow-y: auto; white-space: pre-wrap; border: 1px solid #aaa; padding: 8px;",
                     onkeydown: handle_keydown,
                     oninput: handle_input,
-                    onmouseup: move |e| { update_caret_click(e); },
-                    onclick: move |e| { update_caret_click(e); },
+                    onmouseup: move |e| { update_caret_click(); },
+                    onclick: move |e| { update_caret_click(); },
                     // Here we simply display the raw text.
                     // In a more advanced version you might run a syntax highlighter
                     // to wrap tokens in spans for color/styling.
